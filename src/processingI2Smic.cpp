@@ -2,16 +2,8 @@
 #include <iostream>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 #include "driver/i2s.h"
-using namespace std;
-
-// #include "esp_log.h"
-// #include "esp_system.h"
-// #include <esp_mn_iface.h>
-// #include <esp_mn_models.h>
-
-// #include <esp_dsp.h>
-// #include <esp_vad.h>
 
 #include <string.h>
 #include <arduinoFFT.h>
@@ -24,12 +16,17 @@ using namespace std;
 #define I2S_SD 13
 #define I2S_SCK 2
 
+float noiseFloor = 0.0;
+const float noiseThreshold = 1.0;
+bool voiceDetected = false;
+
 // Define global variables
-uint16_t microphoneData[BUFFER_LENGTH];
+// uint16_t microphoneData[BUFFER_LENGTH];
+int16_t microphoneData[BUFFER_LENGTH];
 SemaphoreHandle_t microphoneMutex;
 
 // Threshold for mean
-#define MEAN_THRESHOLD 50000
+#define MEAN_THRESHOLD 60
 
 // Parte da media móvel
 #define MOVING_AVERAGE_SIZE 20
@@ -54,13 +51,13 @@ double movingAverageFilter(double inputValue)
 
 void i2sMicrophoneTask(void *pvParameters)
 {
-    uint16_t *audioBuffer = (uint16_t *)malloc(BUFFER_LENGTH);
+    // uint16_t *audioBuffer = (uint16_t *)malloc(BUFFER_LENGTH);
+    int16_t *audioBuffer = (int16_t *)malloc(BUFFER_LENGTH);
     size_t bytesRead = 0;
 
     while (1)
     {
         // Read audio data from I2S
-        // i2s_read(I2S_NUM_0, audioBuffer, BUFFER_LENGTH, &bytesRead, portMAX_DELAY);
         esp_err_t result = i2s_read(I2S_NUM_0, audioBuffer, BUFFER_LENGTH, &bytesRead, portMAX_DELAY); // no timeout
         if (result == ESP_OK && bytesRead > 0)
         {
@@ -72,108 +69,83 @@ void i2sMicrophoneTask(void *pvParameters)
             xSemaphoreGive(microphoneMutex);
             // Delay or yield to other tasks if necessary
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // Example delay of 10 milliseconds
-
-        // // Print some debug information
-        // printf("Read %d bytes from I2S   |   And the first the sample is %d\n", bytesRead, audioBuffer[0]);
+        vTaskDelay(pdMS_TO_TICKS(10)); // Example delay of 10 milliseconds
     }
-
     free(audioBuffer);
     vTaskDelete(NULL);
 }
 
 // Define task function
-void TaskAudio1(void *pvParameters)
+void CalculateFFT(void *pvParameters)
 {
     arduinoFFT FFT = arduinoFFT(); // Create FFT object
     const double samplingFrequency = SAMPLE_RATE;
-    // double vReal[BUFFER_LENGTH];
-    // double vImag[BUFFER_LENGTH];
     double *vReal = new double[BUFFER_LENGTH];
     double *vImag = new double[BUFFER_LENGTH];
     double freq;
 
     while (1)
     {
-        // Acquire the microphone mutex
-        // xSemaphoreTake(microphoneMutex, portMAX_DELAY);
-
-        // Print some debug information
-        // printf("TaskAudio1 reading microfone %d %d %d %d %d\n", microphoneData[0], microphoneData[1], microphoneData[2], microphoneData[3], microphoneData[4]);
-
         if (xSemaphoreTake(microphoneMutex, portMAX_DELAY) == pdTRUE)
         {
             for (size_t i = 0; i < BUFFER_LENGTH; i++)
             {
-                // vReal[i] = static_cast<double>(microphoneData[i]);
                 vReal[i] = microphoneData[i] / 1.0;
-                // cout << microphoneData[i] / 1.0 << " ";
-                // printf("%f ", microphoneData[i] / 1.0);
-                // printf("%f ",vReal[i]);
-                // cout << vReal[i];
-                // cout << static_cast<double>(microphoneData[i]);
-                // vReal[i] = microphoneData[i];
-                // printf("%d ",microphoneData[i]);
                 vImag[i] = 0.0; // Imaginary part must be zeroed in case of looping to avoid wrong calculations and overflows
-                // printf("%f ",vImag[i]);
             }
             FFT.Windowing(vReal, BUFFER_LENGTH, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
             FFT.Compute(vReal, vImag, BUFFER_LENGTH, FFT_FORWARD);
             FFT.ComplexToMagnitude(vReal, vImag, BUFFER_LENGTH);
             double x = FFT.MajorPeak(vReal, BUFFER_LENGTH, samplingFrequency);
             freq = movingAverageFilter(x);
-            printf("Frequency from FFT %f\n", freq);
+            printf(" | Frequency from FFT %f | ", freq);
 
             xSemaphoreGive(microphoneMutex);
-            // cout << "\n";
         }
         else
         {
-            // Failed to take the semaphore
-            // cout << "Failed to take semaphore";
-            printf("Failed to take semaphore");
+            printf("Failed to take semaphore in task 1");
         }
-
-        // Release the microphone mutex
-        // xSemaphoreGive(microphoneMutex);
-
         // Delay or yield to other tasks if necessary
-        // vTaskDelay(pdMS_TO_TICKS(10)); // Example delay of 100 milliseconds
+        vTaskDelay(pdMS_TO_TICKS(10)); // Example delay of 100 milliseconds
     }
 }
 
 // Define task function
-void TaskAudio2(void *pvParameters)
+void DetectAbnormalSignal(void *pvParameters)
 {
     while (1)
     {
         // Acquire the microphone mutex
-        xSemaphoreTake(microphoneMutex, portMAX_DELAY);
-
-        // Calculate the mean of the audio buffer
-        float mean = 0.0;
-        for (size_t i = 0; i < BUFFER_LENGTH / 8; i++)
+        if (xSemaphoreTake(microphoneMutex, portMAX_DELAY) == pdTRUE)
         {
-            mean += microphoneData[i];
-        }
-        mean /= (BUFFER_LENGTH);
-        printf("Mean %f\n", mean);
+            // Calculate the mean of the audio buffer
+            float mean = 0.0;
+            for (int16_t i = 0; i < BUFFER_LENGTH / 8; ++i)
+            {
+                mean = mean + microphoneData[i] / 1.0;
+            }
+            // Check if the mean exceeds the threshold
+            mean = mean / (BUFFER_LENGTH / 8);
+            if (fabs(mean) > MEAN_THRESHOLD)
+            {
+                printf(" ## Mean %f exceeded the threshold! ## \n", mean);
+            }
+            else
+            {
+                printf(" | Mean %f | \n", mean);
+            }
 
-        // Check if the mean exceeds the threshold
-        if (mean > MEAN_THRESHOLD)
+            // Release the microphone mutex
+            xSemaphoreGive(microphoneMutex);
+        }
+        else
         {
-            printf("Mean exceeded the threshold!\n");
-            // Perform the desired action here
+            printf("Failed to take semaphore in task 2");
         }
-
-        // Print some debug information
-        // printf("TaskAudio2 reading microfone %d %d %d %d %d\n", microphoneData[0], microphoneData[1], microphoneData[2], microphoneData[3], microphoneData[4]);
-
-        // Release the microphone mutex
-        xSemaphoreGive(microphoneMutex);
 
         // Delay or yield to other tasks if necessary
-        vTaskDelay(pdMS_TO_TICKS(100)); // Example delay of 100 milliseconds
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -184,13 +156,10 @@ void TaskAudio3(void *pvParameters)
     {
         // Acquire the microphone mutex
         xSemaphoreTake(microphoneMutex, portMAX_DELAY);
-
         // Print some debug information
         // printf("TaskAudio3 reading microfone %d %d %d %d %d\n", microphoneData[0], microphoneData[1], microphoneData[2], microphoneData[3], microphoneData[4]);
-
         // Release the microphone mutex
         xSemaphoreGive(microphoneMutex);
-
         // Delay or yield to other tasks if necessary
         vTaskDelay(pdMS_TO_TICKS(100)); // Example delay of 100 milliseconds
     }
@@ -233,10 +202,7 @@ extern "C" void app_main()
     // Set up a task for capturing audio from the microphone
     xTaskCreatePinnedToCore(i2sMicrophoneTask, "i2sMicrophoneTask", 2048, NULL, 1, NULL, 0);
 
-    xTaskCreate(TaskAudio1, "AudioTask1", 2048, NULL, 1, NULL);
-    xTaskCreate(TaskAudio2, "AudioTask2", 2048, NULL, 1, NULL);
-    xTaskCreate(TaskAudio3, "AudioTask3", 2048, NULL, 1, NULL);
-
-    // Start the FreeRTOS scheduler
-    // vTaskStartScheduler();
+    xTaskCreate(CalculateFFT, "CalculateFFT", 2048, NULL, 1, NULL);
+    xTaskCreate(DetectAbnormalSignal, "DetectAbnormalSignal", 2048, NULL, 1, NULL);
+    // xTaskCreate(TaskAudio3, "AudioTask3", 2048, NULL, 1, NULL);
 }
